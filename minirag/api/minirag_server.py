@@ -973,6 +973,7 @@ def create_app(args):
                 content = ""
                 for page in reader.pages:
                     content += page.extract_text() + "\n"
+                metadata = reader.metadata or {}
 
             case ".docx":
                 if not pm.is_installed("python-docx"):
@@ -1001,7 +1002,7 @@ def create_app(args):
 
         # Insert content into RAG system
         if content:
-            await rag.ainsert(content)
+            await rag.ainsert(content, file_path=file_path._str)
             doc_manager.mark_as_indexed(file_path)
             logging.info(f"Successfully indexed file: {file_path}")
         else:

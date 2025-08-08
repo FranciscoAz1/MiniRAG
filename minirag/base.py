@@ -36,6 +36,8 @@ class QueryParam:
 
     hl_keywords: list[str] = field(default_factory=list)
     ll_keywords: list[str] = field(default_factory=list)
+    # Metadata filtering support
+    metadata_filter: dict[str, Any] = field(default_factory=dict)
     # Conversation history support
     conversation_history: list[dict] = field(
         default_factory=list
@@ -177,6 +179,8 @@ class DocProcessingStatus:
     """Number of chunks after splitting, used for processing"""
     error: Optional[str] = None
     """Error message if failed"""
+    file_path: Optional[str] = None
+    """Path to the source file, if applicable"""
     metadata: dict[str, Any] = field(default_factory=dict)
     """Additional metadata"""
 

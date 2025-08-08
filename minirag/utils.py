@@ -30,6 +30,11 @@ logger = logging.getLogger("minirag")
 def set_logger(log_file: str):
     logger.setLevel(logging.DEBUG)
 
+    # Create directory if it doesn't exist
+    log_dir = os.path.dirname(log_file)
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+
     file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(logging.DEBUG)
 

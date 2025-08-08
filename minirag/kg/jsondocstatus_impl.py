@@ -85,6 +85,10 @@ class JsonDocStatusStorage(DocStatusStorage):
             ]
         )
 
+    async def all_keys(self) -> list[str]:
+        """Return all document IDs in storage"""
+        return list(self._data.keys())
+
     async def get_status_counts(self) -> Dict[str, int]:
         """Get counts of documents in each status"""
         counts = {status: 0 for status in DocStatus}

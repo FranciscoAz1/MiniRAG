@@ -1,6 +1,7 @@
 import asyncio
 from typing import Any, Union, List, Set, Dict
 import weaviate
+import weaviate.cluster
 from weaviate.exceptions import WeaviateQueryException
 from dataclasses import dataclass, field
 from minirag.base import (

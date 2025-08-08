@@ -73,7 +73,6 @@ STORAGES = {
 
 load_dotenv(dotenv_path=".env", override=False)
 
-
 def lazy_external_import(module_name: str, class_name: str):
     """Lazily import a class from an external module based on the package of the caller."""
 
@@ -337,9 +336,9 @@ class MiniRAG:
             # set client
             storage.db = db_client
 
-    def insert(self, string_or_strings):
+    def insert(self, string_or_strings, metadata=None):
         loop = always_get_an_event_loop()
-        return loop.run_until_complete(self.ainsert(string_or_strings))
+        return loop.run_until_complete(self.ainsert(string_or_strings, metadata=metadata))
 
     async def ainsert(
         self,
@@ -347,13 +346,15 @@ class MiniRAG:
         split_by_character: str | None = None,
         split_by_character_only: bool = False,
         ids: str | list[str] | None = None,
+        file_path: str | None = None,
+        metadata: dict[str, Any] | list[dict[str, Any]] | None = None,
     ) -> None:
         if isinstance(input, str):
             input = [input]
         if isinstance(ids, str):
             ids = [ids]
 
-        await self.apipeline_enqueue_documents(input, ids)
+        await self.apipeline_enqueue_documents(input, ids, file_path, metadata)
         await self.apipeline_process_enqueue_documents(
             split_by_character, split_by_character_only
         )
@@ -389,7 +390,7 @@ class MiniRAG:
         await self._insert_done()
 
     async def apipeline_enqueue_documents(
-        self, input: str | list[str], ids: list[str] | None = None
+        self, input: str | list[str], ids: list[str] | None = None, file_path: str | None = None, metadata: dict[str, Any] | list[dict[str, Any]] | None = None
     ) -> None:
         """
         Pipeline for Processing Documents
@@ -404,33 +405,48 @@ class MiniRAG:
             input = [input]
         if isinstance(ids, str):
             ids = [ids]
+        if isinstance(metadata, dict):
+            metadata = [metadata]
+
+        # Validate metadata matches input length
+        if metadata is not None:
+            if len(metadata) != len(input):
+                raise ValueError("Number of metadata dictionaries must match the number of documents")
+        else:
+            metadata = [{}] * len(input)  # Default empty metadata for each document
 
         if ids is not None:
             if len(ids) != len(input):
                 raise ValueError("Number of IDs must match the number of documents")
             if len(ids) != len(set(ids)):
                 raise ValueError("IDs must be unique")
-            contents = {id_: doc for id_, doc in zip(ids, input)}
+            contents = {id_: (doc, meta) for id_, doc, meta in zip(ids, input, metadata)}
         else:
-            input = list(set(clean_text(doc) for doc in input))
-            contents = {compute_mdhash_id(doc, prefix="doc-"): doc for doc in input}
+            # Create unique pairs using string representation for deduplication
+            input_meta_pairs = list(set((clean_text(doc), str(meta)) for doc, meta in zip(input, metadata)))
+            contents = {compute_mdhash_id(doc + str(meta), prefix="doc-"): (doc, eval(meta)) for doc, meta in input_meta_pairs}
 
-        unique_contents = {
-            id_: content
-            for content, id_ in {
-                content: id_ for id_, content in contents.items()
-            }.items()
-        }
+        # Remove duplicates by using content + metadata string representation as key
+        seen_content_meta = {}
+        unique_contents = {}
+        for id_, (content, meta) in contents.items():
+            # Create a hashable key using content + string representation of metadata
+            content_meta_key = (content, str(meta))
+            if content_meta_key not in seen_content_meta:
+                seen_content_meta[content_meta_key] = id_
+                unique_contents[id_] = (content, meta)
         new_docs: dict[str, Any] = {
             id_: {
+                "file_path": file_path,
                 "content": content,
                 "content_summary": get_content_summary(content),
                 "content_length": len(content),
                 "status": DocStatus.PENDING,
                 "created_at": datetime.now().isoformat(),
                 "updated_at": datetime.now().isoformat(),
+                "metadata": meta,
             }
-            for id_, content in unique_contents.items()
+            for id_, (content, meta) in unique_contents.items()
         }
 
         all_new_doc_ids = set(new_docs.keys())
@@ -485,6 +501,7 @@ class MiniRAG:
                     compute_mdhash_id(dp["content"], prefix="chunk-"): {
                         **dp,
                         "full_doc_id": doc_id,
+                        "metadata": status_doc.metadata if hasattr(status_doc, 'metadata') else {},
                     }
                     for dp in self.chunking_func(
                         status_doc.content,
@@ -506,6 +523,8 @@ class MiniRAG:
                             "content": status_doc.content,
                             "content_summary": status_doc.content_summary,
                             "content_length": status_doc.content_length,
+                            "file_path": status_doc.file_path,
+                            "metadata": getattr(status_doc, 'metadata', {}),
                             "created_at": status_doc.created_at,
                             "updated_at": datetime.now().isoformat(),
                         }
@@ -570,6 +589,81 @@ class MiniRAG:
             raise ValueError(f"Unknown mode {param.mode}")
         await self._query_done()
         return response
+
+    async def query_by_metadata(self, metadata_filter: dict[str, Any]) -> list[dict]:
+        """Query documents by metadata filter"""
+        try:
+            # Get all document IDs
+            all_doc_ids = await self.doc_status.all_keys()
+            
+            if not all_doc_ids:
+                return []
+            
+            # Filter documents by metadata
+            matching_doc_ids = []
+            
+            for doc_id in all_doc_ids:
+                # Get the document data
+                doc_data = await self.doc_status.get_by_id(doc_id)
+                
+                if doc_data is not None:
+                    doc_metadata = doc_data.get('metadata', {})
+                    
+                    # Check if document matches the metadata filter
+                    if self._matches_metadata_filter(doc_metadata, metadata_filter):
+                        matching_doc_ids.append(doc_id)
+            
+            if not matching_doc_ids:
+                return []
+            
+            # Get the detailed document information
+            results = []
+            for doc_id in matching_doc_ids:
+                doc_data = await self.doc_status.get_by_id(doc_id)
+                if doc_data is not None:
+                    results.append({
+                        "doc_id": doc_id,
+                        "content": doc_data.get("content", ""),
+                        "metadata": doc_data.get("metadata", {}),
+                        "file_path": doc_data.get("file_path"),
+                        "content_summary": doc_data.get("content_summary", ""),
+                        "created_at": doc_data.get("created_at"),
+                        "status": doc_data.get("status")
+                    })
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error querying by metadata: {e}")
+            return []
+
+    def _matches_metadata_filter(self, doc_metadata: dict[str, Any], filter_criteria: dict[str, Any]) -> bool:
+        """Check if document metadata matches filter criteria"""
+        for key, expected_value in filter_criteria.items():
+            if key not in doc_metadata:
+                return False
+            
+            doc_value = doc_metadata[key]
+            
+            # Handle different types of matching
+            if isinstance(expected_value, list) and isinstance(doc_value, list):
+                # Check if any item in expected_value exists in doc_value
+                if not any(item in doc_value for item in expected_value):
+                    return False
+            elif isinstance(expected_value, list):
+                # Check if doc_value is in expected_value list
+                if doc_value not in expected_value:
+                    return False
+            elif isinstance(doc_value, list):
+                # Check if expected_value is in doc_value list
+                if expected_value not in doc_value:
+                    return False
+            else:
+                # Direct comparison
+                if doc_value != expected_value:
+                    return False
+        
+        return True
 
     async def _query_done(self):
         tasks = []

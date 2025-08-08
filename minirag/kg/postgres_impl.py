@@ -472,6 +472,7 @@ class PGDocStatusStorage(DocStatusStorage):
                 created_at=element["created_at"],
                 updated_at=element["updated_at"],
                 chunks_count=element["chunks_count"],
+                file_path=element.get("file_path"),
             )
             for element in result
         }

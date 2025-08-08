@@ -1471,9 +1471,38 @@ async def minirag_query(  # MiniRAG
     sys_prompt = sys_prompt_temp.format(
         context_data=context, response_type=query_param.response_type
     )
+    
+    
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
     )
 
-    return response
+    # Extract entities section from context
+    entities_from_response = ""
+    if context:
+        import re
+        entities_match = re.search(r"-----Entities-----\s*```csv\s*(.*?)\s*```", context, re.DOTALL)
+        if entities_match:
+            # Process CSV to remove score column
+            csv_content = entities_match.group(1)
+            lines = csv_content.strip().split('\n')
+            processed_lines = []
+            
+            for line in lines:
+                parts = line.split(',')
+                if len(parts) >= 3:
+                    # Remove the score column (index 1) and keep entity (index 0) and description (index 2)
+                    processed_parts = [parts[0], parts[2]]
+                    processed_lines.append(','.join(processed_parts))
+                else:
+                    # Keep line as is if it doesn't have enough parts
+                    processed_lines.append(line)
+            
+            processed_csv = '\n'.join(processed_lines)
+            entities_from_response = f"-----Entities-----\n```csv\n{processed_csv}\n```"
+
+    # put response
+    output = f"-----Query Engineered-----\n" + result + "\n" + entities_from_response + "\n -----LLM Response:---- \n\n" + response
+
+    return output
