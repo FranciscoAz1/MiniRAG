@@ -1120,6 +1120,130 @@ async def naive_query(
 
     return response
 
+async def doc_query(
+    doc_id: str,
+    doc_status_storage: BaseKVStorage,  # expected to store DocProcessingStatus-like dicts
+    chunks_vdb: BaseVectorStorage,
+    text_chunks_db: BaseKVStorage[TextChunkSchema],
+    knowledge_graph_inst: BaseGraphStorage,
+    query_param: QueryParam,
+    global_config: dict,
+):
+    """Retrieve detailed information for a single document.
+
+    Returns a dictionary with:
+    - metadata & status fields
+    - number of chunks
+    - chunk list (optionally truncated by token limits)
+    - related entities (graph nodes whose source_id contains any chunk id)
+    - related relationships (graph edges whose source_id contains any chunk id)
+    """
+    # 1. Fetch document status / metadata
+    doc_data = await doc_status_storage.get_by_id(doc_id)
+    if doc_data is None:
+        return {"error": f"Document {doc_id} not found"}
+
+    # 2. Collect chunk ids by scanning text_chunks_db (no direct index available)
+    try:
+        all_chunk_ids = await text_chunks_db.all_keys()
+    except Exception:
+        all_chunk_ids = []
+
+    related_chunk_ids = []
+    related_chunks = []
+    # Fetch in batches to reduce memory usage
+    batch_size = 100
+    for i in range(0, len(all_chunk_ids), batch_size):
+        batch_ids = all_chunk_ids[i : i + batch_size]
+        batch = await text_chunks_db.get_by_ids(batch_ids)
+        for cid, chunk in zip(batch_ids, batch):
+            if not chunk:
+                continue
+            if chunk.get("full_doc_id") == doc_id:
+                related_chunk_ids.append(cid)
+                related_chunks.append({
+                    "id": cid,
+                    "content": chunk.get("content", ""),
+                    "tokens": chunk.get("tokens"),
+                    "chunk_order_index": chunk.get("chunk_order_index"),
+                })
+
+    # Optional truncation by token budget (reuse truncate_list_by_token_size helper)
+    try:
+        from .utils import truncate_list_by_token_size
+
+        related_chunks = truncate_list_by_token_size(
+            related_chunks,
+            key=lambda x: x["content"],
+            max_token_size=query_param.max_token_for_text_unit,
+        )
+    except Exception:
+        pass
+
+    # 3. Gather entities & relationships from graph (best-effort; depends on storage implementation)
+    entities = []
+    relationships = []
+    chunk_id_set = set(related_chunk_ids)
+
+    # Helper to test if a source_id field (concatenated by GRAPH_FIELD_SEP) intersects chunk ids
+    def _source_matches(source_id: str) -> bool:
+        if not source_id:
+            return False
+        parts = [p for p in source_id.split(GRAPH_FIELD_SEP) if p]
+        return any(p in chunk_id_set for p in parts)
+
+    # Attempt introspection for nodes/edges if underlying storage exposes a NetworkX-like _graph
+    if hasattr(knowledge_graph_inst, "_graph"):
+        try:
+            nx_graph = getattr(knowledge_graph_inst, "_graph")
+            for node_id, data in nx_graph.nodes(data=True):
+                source_field = data.get("source_id", "")
+                if _source_matches(source_field):
+                    entities.append(
+                        {
+                            "entity_name": node_id,
+                            "entity_type": data.get("entity_type"),
+                            "description": data.get("description"),
+                            "source_id": source_field,
+                        }
+                    )
+            for src, tgt, edata in nx_graph.edges(data=True):
+                source_field = edata.get("source_id", "")
+                if _source_matches(source_field):
+                    relationships.append(
+                        {
+                            "src_id": src,
+                            "tgt_id": tgt,
+                            "description": edata.get("description"),
+                            "keywords": edata.get("keywords"),
+                            "weight": edata.get("weight"),
+                            "source_id": source_field,
+                        }
+                    )
+        except Exception as e:  # pragma: no cover - best effort
+            logger.error(f"Failed to enumerate graph for doc query: {e}")
+    else:
+        # Fallback: cannot enumerate entities/relationships for this backend
+        logger.warning(
+            "Graph storage does not expose '_graph'; entity/relationship listing skipped"
+        )
+
+    result = {
+        "doc_id": doc_id,
+        "status": doc_data.get("status"),
+        "file_path": doc_data.get("file_path"),
+        "created_at": doc_data.get("created_at"),
+        "updated_at": doc_data.get("updated_at"),
+        "content_summary": doc_data.get("content_summary"),
+        "content_length": doc_data.get("content_length"),
+        "chunks_count": doc_data.get("chunks_count") or len(related_chunks),
+        "metadata": doc_data.get("metadata", {}),
+        "chunks": related_chunks,
+        "entities": entities,
+        "relationships": relationships,
+    }
+    return result
+
 
 async def path2chunk(
     scored_edged_reasoning_path, knowledge_graph_inst, pairs_append, query, max_chunks=5

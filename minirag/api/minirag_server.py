@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Request
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Request, Body
 
 # Backend (Python)
 # Add this to store progress globally
@@ -974,7 +974,6 @@ def create_app(args):
                 for page in reader.pages:
                     content += page.extract_text() + "\n"
                 metadata = reader.metadata or {}
-
             case ".docx":
                 if not pm.is_installed("python-docx"):
                     pm.install("python-docx")
@@ -1002,7 +1001,7 @@ def create_app(args):
 
         # Insert content into RAG system
         if content:
-            await rag.ainsert(content, file_path=file_path._str)
+            await rag.ainsert(content, file_path=file_path._str, metadata=metadata)
             doc_manager.mark_as_indexed(file_path)
             logging.info(f"Successfully indexed file: {file_path}")
         else:
@@ -1052,6 +1051,64 @@ def create_app(args):
         finally:
             with progress_lock:
                 scan_progress["is_scanning"] = False
+            # Best-effort regenerate knowledge graph after scan
+            try:
+                await _maybe_regenerate_graph()
+            except Exception as ge:
+                logging.warning(f"Graph regeneration after scan failed: {ge}")
+
+    # ------------------ Knowledge Graph Regeneration Support ------------------
+    async def _maybe_regenerate_graph(force: bool = False):
+        """Regenerate knowledge_graph.html if GraphML source exists.
+        Returns Path or None.
+        """
+        graphml_candidates = [
+            Path.cwd() / "LiHua-World" / "graph_chunk_entity_relation.graphml",
+            Path(args.working_dir) / "graph_chunk_entity_relation.graphml" if hasattr(args, "working_dir") else None,
+        ]
+        graphml = next((p for p in graphml_candidates if p and p.exists()), None)
+        if not graphml:
+            if force:
+                raise FileNotFoundError("GraphML source not found")
+            return None
+        try:
+            if not pm.is_installed("pyvis"):
+                pm.install("pyvis")
+            if not pm.is_installed("networkx"):
+                pm.install("networkx")
+            import networkx as nx
+            from pyvis.network import Network
+            import random
+            G = nx.read_graphml(graphml)
+            net = Network(height="100vh", notebook=False)
+            net.from_nx(G)
+            for node in net.nodes:
+                node["color"] = f"#{random.randint(0, 0xFFFFFF):06x}"
+                if "description" in node:
+                    node["title"] = node.get("description")
+            for edge in net.edges:
+                if "description" in edge:
+                    edge["title"] = edge.get("description")
+            target = Path(__file__).parent / "static" / "knowledge_graph.html"
+            net.show(str(target))
+            logging.info(f"Regenerated knowledge_graph.html -> {target}")
+            return target
+        except Exception as e:
+            if force:
+                raise
+            logging.warning(f"Graph regeneration skipped: {e}")
+            return None
+
+    @app.post("/graphs/regenerate", dependencies=[Depends(optional_api_key)])
+    async def regenerate_graph(force: bool = Body(False)):
+        """Force regenerate knowledge_graph.html from GraphML source."""
+        try:
+            result = await _maybe_regenerate_graph(force=force)
+            if result is None:
+                return {"status": "skipped", "reason": "GraphML missing"}
+            return {"status": "success", "file": str(result)}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/documents/scan-progress")
     async def get_scan_progress():
@@ -1089,16 +1146,23 @@ def create_app(args):
                     detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
                 )
 
-            file_path = doc_manager.input_dir / file.filename
+            safe_name = file.filename or f"upload_{int(time.time())}"
+            file_path = doc_manager.input_dir / safe_name
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
 
             # Immediately index the uploaded file
             await index_file(file_path)
 
+            # Best-effort regenerate graph after upload
+            try:
+                await _maybe_regenerate_graph()
+            except Exception as ge:
+                logging.info(f"Graph regeneration skipped after upload: {ge}")
+
             return {
                 "status": "success",
-                "message": f"File uploaded and indexed: {file.filename}",
+                "message": f"File uploaded and indexed: {safe_name}",
                 "total_documents": len(doc_manager.indexed_files),
             }
         except Exception as e:
@@ -1878,6 +1942,45 @@ def create_app(args):
         """Get current system status"""
         return doc_manager.indexed_files
 
+    async def _resolve_doc_id_from_filename(filename: str) -> Optional[str]:
+        """Best-effort resolve a document id from a filename by matching stored file_path basenames."""
+        try:
+            all_doc_ids = await rag.doc_status.all_keys()
+            for did in all_doc_ids:
+                doc = await rag.doc_status.get_by_id(did)
+                if not doc:
+                    continue
+                fp = doc.get("file_path")
+                if fp and os.path.basename(fp) == filename:
+                    return did
+        except Exception as e:
+            logging.warning(f"Filename to doc_id resolution failed: {e}")
+        return None
+
+    @app.get("/documents/info", dependencies=[Depends(optional_api_key)])
+    async def get_document_info(filename: Optional[str] = None, doc_id: Optional[str] = None):
+        """Return detailed document information (metadata, chunks, entities, relationships).
+
+        Query params:
+          - doc_id: direct document identifier
+          - filename: original file name (will attempt to map to doc_id)
+        At least one must be provided.
+        """
+        if not doc_id and not filename:
+            raise HTTPException(status_code=400, detail="Provide either doc_id or filename")
+        if not doc_id and filename:
+            doc_id = await _resolve_doc_id_from_filename(filename)
+            if not doc_id:
+                raise HTTPException(status_code=404, detail="Document not found for filename")
+        try:
+            info = await rag.aquery(doc_id, param=QueryParam(mode="doc"))  # type: ignore[arg-type]
+            if isinstance(info, str):  # Should not happen for doc mode but guard anyway
+                return {"doc_id": doc_id, "raw": info}
+            return info
+        except Exception as e:
+            trace_exception(e)
+            raise HTTPException(status_code=500, detail=str(e))
+
     @app.get("/health", dependencies=[Depends(optional_api_key)])
     async def get_status():
         """Get current system status"""
@@ -1917,6 +2020,32 @@ def create_app(args):
     # Serve the static files
     static_dir = Path(__file__).parent / "static"
     static_dir.mkdir(exist_ok=True)
+
+    # Ensure generated knowledge_graph.html (from graph_with_html.py) is available under static root
+    try:
+        # Possible source locations: project root, working dir, LiHua-World dir
+        candidate_paths = [
+            Path.cwd() / "knowledge_graph.html",
+            Path(args.working_dir) / "knowledge_graph.html" if hasattr(args, "working_dir") else None,
+            Path.cwd() / "LiHua-World" / "knowledge_graph.html",
+        ]
+        for src in candidate_paths:
+            if src and src.exists():
+                target = static_dir / "knowledge_graph.html"
+                # Copy/overwrite each startup to keep it fresh
+                if not target.exists() or src.stat().st_mtime > target.stat().st_mtime:
+                    try:
+                        import shutil
+                        shutil.copy2(src, target)
+                        logging.info(f"Copied knowledge_graph.html from {src} -> {target}")
+                    except Exception as ce:
+                        logging.warning(f"Failed to copy knowledge_graph.html: {ce}")
+                break  # use the first found
+        else:
+            logging.info("knowledge_graph.html not found in expected locations; knowledge-graph page may show a 404 iframe.")
+    except Exception as e:
+        logging.warning(f"Unexpected error preparing knowledge_graph.html: {e}")
+
     app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
     return app

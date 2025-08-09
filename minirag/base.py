@@ -16,7 +16,7 @@ T = TypeVar("T")
 
 @dataclass
 class QueryParam:
-    mode: Literal["light", "naive", "mini"] = "mini"
+    mode: Literal["light", "naive", "mini", "doc"] = "mini"
     only_need_context: bool = False
     only_need_prompt: bool = False
     response_type: str = "Multiple Paragraphs"

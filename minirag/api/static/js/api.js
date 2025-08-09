@@ -9,7 +9,9 @@ const state = {
 // Utility functions
 const showToast = (message, duration = 3000) => {
     const toast = document.getElementById('toast');
-    toast.querySelector('div').textContent = message;
+    if (!toast) return;
+    const inner = toast.querySelector('div');
+    if (inner) inner.textContent = message;
     toast.classList.remove('hidden');
     setTimeout(() => toast.classList.add('hidden'), duration);
 };
@@ -30,18 +32,6 @@ const pages = {
 
             <div class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-gray-400 transition-colors">
                 <input type="file" id="fileInput" multiple accept=".txt,.md,.doc,.docx,.pdf,.pptx" class="hidden">
-                <label for="fileInput" class="cursor-pointer">
-                    <svg class="mx-auto h-12 w-12 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
-                    </svg>
-                    <p class="mt-2 text-gray-600">Drag files here or click to select</p>
-                    <p class="text-sm text-gray-500">Supported formats: TXT, MD, DOC, PDF, PPTX</p>
-                </label>
-            </div>
-
-            <div id="fileList" class="space-y-2">
-                <h3 class="text-lg font-semibold text-gray-700">Selected Files</h3>
-                <div class="space-y-2"></div>
             </div>
             <div id="uploadProgress" class="hidden mt-4">
                 <div class="w-full bg-gray-200 rounded-full h-2.5">
@@ -98,14 +88,19 @@ const pages = {
     `,
 
     'knowledge-graph': () => `
-        <div class="flex items-center justify-center h-full">
-            <div class="text-center">
-                <svg class="mx-auto h-12 w-12 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"/>
-                </svg>
-                <h3 class="mt-2 text-sm font-medium text-gray-900">Under Construction</h3>
-                <p class="mt-1 text-sm text-gray-500">Knowledge graph visualization will be available in a future update.</p>
+        <div class="space-y-4 h-full flex flex-col">
+            <h2 class="text-2xl font-bold text-gray-800">Knowledge Graph</h2>
+            <div class="flex-1 border rounded-lg overflow-hidden shadow-sm relative">
+                <iframe id="kgFrame" src="/knowledge_graph.html" class="w-full h-full" frameborder="0"></iframe>
             </div>
+            <p class="text-sm text-gray-500">If the graph does not display, ensure knowledge_graph.html has been generated (run graph_with_html.py).</p>
+        </div>
+    `,
+    'file-info': () => `
+        <div class="space-y-6">
+            <h2 class="text-2xl font-bold text-gray-800">File Info</h2>
+            <div id="fileInfo" class="p-4 bg-white rounded-lg shadow text-sm text-gray-700">Loading...</div>
+            <button onclick="navigate('file-manager')" class="text-blue-600 hover:underline text-sm">&larr; Back</button>
         </div>
     `,
 
@@ -171,11 +166,14 @@ const handlers = {
         const updateIndexedFiles = async () => {
             const response = await fetchWithAuth('/health');
             const data = await response.json();
-            indexedFiles.innerHTML = data.indexed_files.map(file => `
-                <div class="flex items-center justify-between bg-white p-3 rounded-lg shadow-sm">
-                    <span>${file}</span>
-                </div>
-            `).join('');
+            indexedFiles.innerHTML = data.indexed_files.map(file => {
+                const name = file.split(/[/\\]/).pop();
+                return `
+                <div class=\"flex items-center justify-between bg-white p-3 rounded-lg shadow-sm\">
+                    <span class=\"truncate\">${name}</span>
+                    <button class=\"text-sm text-blue-600 hover:underline ml-4\" onclick=\"openFileInfo('${encodeURIComponent(name)}')\">Info</button>
+                </div>`;
+            }).join('');
         };
 
         dropZone.addEventListener('dragover', (e) => {
@@ -361,6 +359,97 @@ const handlers = {
         }
     },
 
+    'knowledge-graph': () => {
+        // Adjust iframe height dynamically (optional if using flex)
+        const frame = document.getElementById('kgFrame');
+        const resize = () => {
+            if (!frame) return;
+            frame.style.height = `${window.innerHeight - frame.getBoundingClientRect().top - 24}px`;
+        };
+        window.addEventListener('resize', resize);
+        resize();
+    },
+    'file-info': () => {
+        const params = new URLSearchParams(location.hash.split('?')[1] || '');
+        const fname = params.get('f');
+        const box = document.getElementById('fileInfo');
+        if (!fname) { box.textContent = 'No file selected'; return; }
+        box.innerHTML = `<div class=\"space-y-2\">
+            <div><span class=\"font-semibold\">Filename:</span> ${fname}</div>
+            <div id=\"docMeta\" class=\"text-sm text-gray-600\">Loading document info...</div>
+            <div id=\"docChunks\" class=\"mt-4\"></div>
+            <div id=\"docEntities\" class=\"mt-4\"></div>
+            <div id=\"docRelationships\" class=\"mt-4\"></div>
+        </div>`;
+
+        (async () => {
+            try {
+                const res = await fetch(`/documents/info?filename=${encodeURIComponent(fname)}`);
+                if (!res.ok) {
+                    document.getElementById('docMeta').textContent = `Error: ${res.status}`;
+                    return;
+                }
+                const data = await res.json();
+                const metaEl = document.getElementById('docMeta');
+                metaEl.innerHTML = `
+                    <div><span class=\"font-semibold\">Doc ID:</span> ${data.doc_id || 'n/a'}</div>
+                    <div><span class=\"font-semibold\">Status:</span> ${data.status}</div>
+                    <div><span class=\"font-semibold\">Created:</span> ${data.created_at}</div>
+                    <div><span class=\"font-semibold\">Updated:</span> ${data.updated_at}</div>
+                    <div><span class=\"font-semibold\">Length:</span> ${data.content_length}</div>
+                    <div><span class=\"font-semibold\">Chunks:</span> ${data.chunks_count}</div>
+                    <div><span class=\"font-semibold\">Metadata:</span> <pre class=\"whitespace-pre-wrap bg-gray-100 p-2 rounded\">${JSON.stringify(data.metadata, null, 2)}</pre></div>
+                `;
+                // Chunks
+                // const chunksEl = document.getElementById('docChunks');
+                // if (data.chunks && data.chunks.length) {
+                //     const chunkHtml = data.chunks.map(c => `
+                //         <div class=\"p-2 border rounded mb-2 bg-white shadow-sm\">
+                //             <div class=\"text-xs text-gray-500 mb-1\">Chunk ${c.chunk_order_index ?? ''} (${c.tokens ?? '?'} tokens)</div>
+                //             <div class=\"text-sm whitespace-pre-wrap\">${(c.content || '').slice(0, 500)}${(c.content || '').length > 500 ? '...' : ''}</div>
+                //         </div>`).join('');
+                //     chunksEl.innerHTML = `<h3 class=\"font-semibold mb-2\">Chunks</h3>${chunkHtml}`;
+                // } else {
+                //     chunksEl.innerHTML = '<h3 class="font-semibold mb-2">Chunks</h3><div class="text-sm text-gray-500">No chunks found</div>';
+                // }
+                // Entities
+                const entEl = document.getElementById('docEntities');
+                if (data.entities && data.entities.length) {
+                    const entHtml = data.entities.map(e => `
+                        <tr>
+                            <td class=\"px-2 py-1 border\">${e.entity_name}</td>
+                            <td class=\"px-2 py-1 border\">${e.entity_type || ''}</td>
+                            <td class=\"px-2 py-1 border text-xs\">${(e.description || '').slice(0,150)}</td>
+                        </tr>`).join('');
+                    entEl.innerHTML = `<h3 class=\"font-semibold mb-2\">Entities</h3>
+                        <div class=\"overflow-x-auto\"><table class=\"min-w-full text-xs border\">
+                        <thead><tr class=\"bg-gray-100\"><th class=\"px-2 py-1 border\">Name</th><th class=\"px-2 py-1 border\">Type</th><th class=\"px-2 py-1 border\">Description</th></tr></thead>
+                        <tbody>${entHtml}</tbody></table></div>`;
+                } else {
+                    entEl.innerHTML = '<h3 class="font-semibold mb-2">Entities</h3><div class="text-sm text-gray-500">No entities found</div>';
+                }
+                // Relationships
+                const relEl = document.getElementById('docRelationships');
+                if (data.relationships && data.relationships.length) {
+                    const relHtml = data.relationships.map(r => `
+                        <tr>
+                            <td class=\"px-2 py-1 border\">${r.src_id}</td>
+                            <td class=\"px-2 py-1 border\">${r.tgt_id}</td>
+                            <td class=\"px-2 py-1 border text-xs\">${(r.description || '').slice(0,150)}</td>
+                            <td class=\"px-2 py-1 border text-xs\">${r.keywords || ''}</td>
+                        </tr>`).join('');
+                    relEl.innerHTML = `<h3 class=\"font-semibold mb-2\">Relationships</h3>
+                        <div class=\"overflow-x-auto\"><table class=\"min-w-full text-xs border\">
+                        <thead><tr class=\"bg-gray-100\"><th class=\"px-2 py-1 border\">Source</th><th class=\"px-2 py-1 border\">Target</th><th class=\"px-2 py-1 border\">Description</th><th class=\"px-2 py-1 border\">Keywords</th></tr></thead>
+                        <tbody>${relHtml}</tbody></table></div>`;
+                } else {
+                    relEl.innerHTML = '<h3 class="font-semibold mb-2">Relationships</h3><div class="text-sm text-gray-500">No relationships found</div>';
+                }
+            } catch (e) {
+                document.getElementById('docMeta').textContent = 'Failed to load document info';
+            }
+        })();
+    },
     'settings': () => {
         const saveBtn = document.getElementById('saveSettings');
         const apiKeyInput = document.getElementById('apiKeyInput');
@@ -401,4 +490,15 @@ window.removeFile = (fileName) => {
             </button>
         </div>
     `).join('');
+};
+
+window.navigate = (page, hashQuery='') => {
+    location.hash = page + (hashQuery?`?${hashQuery}`:'');
+    document.getElementById('content').innerHTML = pages[page]();
+    if (handlers[page]) handlers[page]();
+    state.currentPage = page;
+};
+
+window.openFileInfo = (fname) => {
+    navigate('file-info', `f=${fname}`);
 };

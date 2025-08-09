@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from .operate import (
     chunking_by_token_size,
     extract_entities,
+    doc_query,
     hybrid_query,
     minirag_query,
     naive_query,
@@ -582,6 +583,16 @@ class MiniRAG:
                 query,
                 self.chunks_vdb,
                 self.text_chunks,
+                param,
+                asdict(self),
+            )
+        elif param.mode == "doc":
+            response = await doc_query(
+                query,
+                self.doc_status,
+                self.chunks_vdb,
+                self.text_chunks,
+                self.chunk_entity_relation_graph,
                 param,
                 asdict(self),
             )
