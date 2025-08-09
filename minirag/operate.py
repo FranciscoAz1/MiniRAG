@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 from typing import Union
+import re
 from collections import Counter, defaultdict
 import warnings
 import json_repair
@@ -1630,3 +1631,137 @@ async def minirag_query(  # MiniRAG
     output = f"-----Query Engineered-----\n" + result + "\n" + entities_from_response + "\n -----LLM Response:---- \n\n" + response
 
     return output
+
+async def meta_query(
+    query: str,
+    doc_status_storage: BaseKVStorage,
+    chunks_vdb: BaseVectorStorage,  # unused but kept for signature parity
+    text_chunks_db: BaseKVStorage[TextChunkSchema],  # unused but kept
+    knowledge_graph_inst: BaseGraphStorage,  # unused but kept
+    query_param: QueryParam,
+    global_config: dict,
+):
+    """Query documents by metadata.
+
+    The incoming "query" should contain a metadata filter either as:
+      1. JSON object string, e.g. '{"author": "Bob", "tags": ["ai","rag"]}'
+      2. Simple key=value pairs separated by commas / semicolons, e.g. 'author=Bob,year=2024'
+
+    Matching rules (subset semantics):
+      - Scalar vs scalar: equality
+      - Scalar expected vs list doc value: expected element must be in list
+      - List expected vs scalar doc value: doc value must be in expected list
+      - List expected vs list doc value: any intersection
+
+    Returns a markdown table summarizing matched documents (max top_k) or,
+    if query_param.only_need_context is True, a JSON string of raw matches.
+    """
+    import json
+
+    # 1. Parse metadata filter
+    metadata_filter: dict = {}
+    q = (query or "").strip()
+    if not q:
+        return "No metadata filter provided"
+    try:
+        if q.startswith("{") and q.endswith("}"):
+            metadata_filter = json.loads(q)
+        else:
+            # Parse key=value pairs
+            parts = [p.strip() for p in re.split(r"[,;]", q) if p.strip()]
+            for part in parts:
+                if "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                # Try JSON decode each value for list/number/bool
+                try:
+                    v_dec = json.loads(v)
+                    metadata_filter[k] = v_dec
+                except Exception:
+                    metadata_filter[k] = v
+    except Exception:
+        return "Failed to parse metadata filter"
+
+    if not metadata_filter:
+        return "Empty metadata filter"
+
+    # 2. Fetch all doc ids
+    try:
+        all_doc_ids = await doc_status_storage.all_keys()
+    except Exception:
+        return "Failed to read documents"
+
+    if not all_doc_ids:
+        return "No documents available"
+
+    # 3. Matching helper replicating semantics in MiniRAG._matches_metadata_filter
+    def matches(doc_meta: dict, flt: dict) -> bool:
+        for k, expected in flt.items():
+            if k not in doc_meta:
+                return False
+            dv = doc_meta[k]
+            if isinstance(expected, list) and isinstance(dv, list):
+                if not any(item in dv for item in expected):
+                    return False
+            elif isinstance(expected, list):
+                if dv not in expected:
+                    return False
+            elif isinstance(dv, list):
+                if expected not in dv:
+                    return False
+            else:
+                if dv != expected:
+                    return False
+        return True
+
+    # 4. Gather matches (respect top_k)
+    matched = []
+    for doc_id in all_doc_ids:
+        if len(matched) >= query_param.top_k:
+            break
+        try:
+            d = await doc_status_storage.get_by_id(doc_id)
+        except Exception:
+            continue
+        if not d:
+            continue
+        if matches(d.get("metadata", {}) or {}, metadata_filter):
+            matched.append({
+                "doc_id": doc_id,
+                "file_path": d.get("file_path"),
+                "created_at": d.get("created_at"),
+                "updated_at": d.get("updated_at"),
+                "status": d.get("status"),
+                "content_length": d.get("content_length"),
+                "chunks_count": d.get("chunks_count"),
+                "metadata": d.get("metadata", {}),
+            })
+
+    if query_param.only_need_context:
+        return json.dumps({"matches": matched, "filter": metadata_filter}, ensure_ascii=False, indent=2)
+
+    if not matched:
+        return "No documents matched the metadata filter"
+
+    # 5. Build markdown table
+    def truncate(v, n=80):
+        s = str(v)
+        return s if len(s) <= n else s[: n - 3] + "..."
+
+    headers = ["doc_id", "status", "created_at", "chunks", "length", "file_path", "metadata"]
+    rows = [" | ".join(headers), " | ".join(["-" * len(h) for h in headers])]
+    for m in matched:
+        rows.append(
+            " | ".join([
+                truncate(m.get("doc_id")),
+                truncate(m.get("status")),
+                truncate(m.get("created_at")),
+                str(m.get("chunks_count", "")),
+                str(m.get("content_length", "")),
+                truncate(m.get("file_path")),
+                truncate(json.dumps(m.get("metadata", {}), ensure_ascii=False)),
+            ])
+        )
+    return "Matched Documents (metadata filter)\n\n" + "\n".join(rows)

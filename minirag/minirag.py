@@ -14,6 +14,7 @@ from .operate import (
     hybrid_query,
     minirag_query,
     naive_query,
+    meta_query,
 )
 
 from .utils import (
@@ -588,6 +589,16 @@ class MiniRAG:
             )
         elif param.mode == "doc":
             response = await doc_query(
+                query,
+                self.doc_status,
+                self.chunks_vdb,
+                self.text_chunks,
+                self.chunk_entity_relation_graph,
+                param,
+                asdict(self),
+            )
+        elif param.mode == "meta":
+            response = await meta_query(
                 query,
                 self.doc_status,
                 self.chunks_vdb,

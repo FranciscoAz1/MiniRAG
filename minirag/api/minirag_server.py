@@ -588,6 +588,8 @@ class SearchMode(str, Enum):
     light = "light"
     naive = "naive"
     mini = "mini"
+    doc = "doc"
+    meta = "meta"
 
 
 class OllamaMessage(BaseModel):
@@ -1977,6 +1979,112 @@ def create_app(args):
             if isinstance(info, str):  # Should not happen for doc mode but guard anyway
                 return {"doc_id": doc_id, "raw": info}
             return info
+        except Exception as e:
+            trace_exception(e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # ---- Metadata update model & endpoint ----
+    class DocumentMetadataUpdate(BaseModel):
+        doc_id: Optional[str] = None
+        filename: Optional[str] = None
+        metadata: Dict[str, Any]
+
+    @app.patch("/documents/metadata", dependencies=[Depends(optional_api_key)])
+    async def update_document_metadata(payload: DocumentMetadataUpdate):
+        """Replace a document's metadata with the provided object.
+
+        One of doc_id or filename must be supplied. Existing metadata is completely
+        replaced (not merged). Empty / blank keys are ignored. Returns updated metadata.
+        """
+        if not payload.doc_id and not payload.filename:
+            raise HTTPException(status_code=400, detail="Provide doc_id or filename")
+
+        # Resolve doc_id from filename if needed
+        doc_id = payload.doc_id
+        if not doc_id and payload.filename:
+            doc_id = await _resolve_doc_id_from_filename(payload.filename)
+            if not doc_id:
+                raise HTTPException(status_code=404, detail="Document not found for filename")
+
+        try:
+            doc = await rag.doc_status.get_by_id(doc_id)  # type: ignore[arg-type]
+            if not doc:
+                raise HTTPException(status_code=404, detail="Document not found")
+
+            # Clean metadata: drop empty keys, keep values as provided
+            cleaned_meta = {k.strip(): v for k, v in (payload.metadata or {}).items() if k and k.strip()}
+            doc["metadata"] = cleaned_meta
+            doc["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+            await rag.doc_status.upsert({doc_id: doc})  # type: ignore[arg-type]
+            return {
+                "status": "success",
+                "doc_id": doc_id,
+                "metadata": cleaned_meta,
+                "updated_at": doc["updated_at"],
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            trace_exception(e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/documents/metadata/keys", dependencies=[Depends(optional_api_key)])
+    async def list_metadata_keys(include_values: bool = True, values_limit: int = 50):
+        """Return aggregated metadata keys (and optional distinct values) across all documents.
+
+        Query Params:
+          - include_values: if true include up to `values_limit` distinct example values for each key
+          - values_limit: max number of distinct values collected per key
+        Response example:
+        {
+          "keys": [{"key": "author", "count": 5, "values_count": 3}],
+          "values": {"author": ["Alice", "Bob"]}
+        }
+        """
+        try:
+            all_keys = await rag.doc_status.all_keys()
+            key_counts: dict[str, int] = {}
+            values: dict[str, set] = {}
+            for did in all_keys:
+                try:
+                    doc = await rag.doc_status.get_by_id(did)
+                    if not doc:
+                        continue
+                    meta = doc.get("metadata", {}) or {}
+                    if not isinstance(meta, dict):
+                        continue
+                    for k, v in meta.items():
+                        if not k:
+                            continue
+                        key_counts[k] = key_counts.get(k, 0) + 1
+                        if include_values:
+                            if k not in values:
+                                values[k] = set()
+                            # Normalize value(s) to list for collection
+                            if isinstance(v, (list, tuple, set)):
+                                for item in v:
+                                    if len(values[k]) < values_limit:
+                                        values[k].add(str(item))
+                            else:
+                                if len(values[k]) < values_limit:
+                                    values[k].add(str(v))
+                except Exception:
+                    continue  # skip faulty doc
+            # Build result using loose typing (dict[str, Any]) to satisfy dynamic structure
+            result: dict[str, Any] = {
+                "keys": [
+                    {
+                        "key": k,
+                        "count": key_counts[k],
+                        "values_count": len(values[k]) if include_values and k in values else 0,
+                    }
+                    for k in sorted(key_counts.keys())
+                ]
+            }
+            if include_values:
+                result["values"] = {k: sorted(list(s)) for k, s in values.items()}  # type: ignore[assignment]
+            return result
         except Exception as e:
             trace_exception(e)
             raise HTTPException(status_code=500, detail=str(e))
