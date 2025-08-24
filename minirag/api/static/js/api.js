@@ -39,7 +39,9 @@
                             <option value="mini">Mini</option>
                             <option value="doc">Doc (enter doc_id)</option>
                             <option value="meta">Metadata</option>
+                            <option value="bm25">BM25</option>
                         </select>
+                        <button id="toggleContextOnly" type="button" class="mt-3 text-xs px-3 py-1 rounded bg-gray-200 hover:bg-gray-300 text-gray-800">Context Only: OFF</button>
                     </div>
                     <div id="standardQueryBlock">
                         <label class="block text-sm font-medium text-gray-700">Query</label>
@@ -149,7 +151,21 @@
             const addMetaFilter = document.getElementById('addMetaFilter');
             const showMetaJson = document.getElementById('showMetaJson');
             const metaJsonPreview = document.getElementById('metaJsonPreview');
+            const toggleContextOnly = document.getElementById('toggleContextOnly');
             let metadataKeys=[]; let keyValues={};
+            let contextOnly = false;
+
+            if (toggleContextOnly) {
+                toggleContextOnly.addEventListener('click', () => {
+                    contextOnly = !contextOnly;
+                    toggleContextOnly.textContent = `Context Only: ${contextOnly ? 'ON' : 'OFF'}`;
+                    toggleContextOnly.classList.toggle('bg-green-500', contextOnly);
+                    toggleContextOnly.classList.toggle('text-white', contextOnly);
+                    if (!contextOnly) {
+                        toggleContextOnly.classList.remove('bg-green-500');
+                    }
+                });
+            }
 
             async function fetchKeys(){ try { const r=await fetchWithAuth('/documents/metadata/keys'); if(!r.ok) return; const d=await r.json(); metadataKeys=(d.keys||[]).map(k=>k.key); keyValues=d.values||{}; } catch(_){} }
             function buildRow(k='',v=''){ const row=document.createElement('div'); row.className='flex gap-2 items-start'; row.innerHTML=`<div class="flex-1 relative"><input class="meta-k w-full border rounded px-2 py-1 text-xs" value="${k}" placeholder="key"><div class="suggestions-k absolute z-10 left-0 right-0 bg-white border rounded shadow max-h-40 overflow-auto hidden"></div></div><div class="flex-1 relative"><input class="meta-v w-full border rounded px-2 py-1 text-xs" value="${v}" placeholder="value (comma for list)"><div class="suggestions-v absolute z-10 left-0 right-0 bg-white border rounded shadow max-h-40 overflow-auto hidden"></div></div><button class="remove-meta-filter text-red-600 text-xs px-2 py-1">✕</button>`; return row; }
@@ -170,7 +186,7 @@
                 else { const qi=document.getElementById('queryInput'); if(!qi.value.trim()){ showToast('Enter a query'); return;} payload=qi.value.trim(); }
                 queryBtn.disabled=true; const old=queryBtn.textContent; queryBtn.textContent='Processing...';
                 try {
-                    const r=await fetchWithAuth('/query',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({query:payload, mode, stream:false, only_need_context: mode==='meta'})});
+                    const r=await fetchWithAuth('/query',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({query:payload, mode, stream:false, only_need_context: contextOnly || mode==='meta'})});
                     const d=await r.json();
                     if(mode==='meta'){
                         let parsed; try { parsed=JSON.parse(d.response); } catch(_){}
