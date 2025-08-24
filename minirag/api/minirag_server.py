@@ -590,6 +590,7 @@ class SearchMode(str, Enum):
     mini = "mini"
     doc = "doc"
     meta = "meta"
+    bm25 = "bm25"  # lexical BM25 retrieval
 
 
 class OllamaMessage(BaseModel):
@@ -1598,6 +1599,7 @@ def create_app(args):
             "/light ": SearchMode.light,
             "/naive ": SearchMode.naive,
             "/mini ": SearchMode.mini,
+            "/bm25 ": SearchMode.bm25,
         }
 
         for prefix, mode in mode_map.items():
@@ -1606,7 +1608,8 @@ def create_app(args):
                 cleaned_query = query[len(prefix) :].lstrip()
                 return cleaned_query, mode
 
-        return query, SearchMode.hybrid
+    # Default to light (hybrid graph+vector) mode when no prefix provided
+        return query, SearchMode.light
 
     @app.post("/api/generate")
     async def generate(raw_request: Request, request: OllamaGenerateRequest):

@@ -1,5 +1,6 @@
 import asyncio
 import os
+import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from functools import partial
@@ -122,8 +123,9 @@ def always_get_an_event_loop() -> asyncio.AbstractEventLoop:
 
 @dataclass
 class MiniRAG:
+    # Use a timestamp safe for Windows paths (replace ':' with '-')
     working_dir: str = field(
-        default_factory=lambda: f"./minirag_cache_{datetime.now().strftime('%Y-%m-%d-%H:%M:%S')}"
+        default_factory=lambda: f"./minirag_cache_{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}"
     )
 
     # RAGmode: str = 'minirag'
@@ -187,6 +189,8 @@ class MiniRAG:
     chunking_func_kwargs: dict = field(default_factory=dict)
 
     max_parallel_insert: int = field(default=int(os.getenv("MAX_PARALLEL_INSERT", 2)))
+    # Suppress noisy external HTTP client logs (httpx / httpcore / ollama)
+    suppress_httpx_logging: bool = True
 
     def __post_init__(self):
         log_file = os.path.join(self.working_dir, "minirag.log")
@@ -197,6 +201,19 @@ class MiniRAG:
         if not os.path.exists(self.working_dir):
             logger.info(f"Creating working directory {self.working_dir}")
             os.makedirs(self.working_dir)
+        
+        # Optionally silence verbose third-party HTTP client loggers
+        if self.suppress_httpx_logging:
+            for _ln in ("httpx", "httpcore", "ollama"):
+                _lg = logging.getLogger(_ln)
+                _lg.setLevel(logging.CRITICAL)
+                _lg.propagate = False
+                # Ensure existing handlers (if any) are raised to CRITICAL
+                for _h in list(_lg.handlers):
+                    try:
+                        _h.setLevel(logging.CRITICAL)
+                    except Exception:
+                        pass
 
         # show config
         global_config = asdict(self)
@@ -305,6 +322,8 @@ class MiniRAG:
                 **self.llm_model_kwargs,
             )
         )
+        # BM25 index state (lazy build). Keys: index, dirty
+        self._bm25_index_state = {"index": None, "dirty": True}
         # Initialize document status storage
         self.doc_status_storage_cls = self._get_storage_class(self.doc_status_storage)
         self.doc_status = self.doc_status_storage_cls(
@@ -377,7 +396,6 @@ class MiniRAG:
                 self.tiktoken_model_name,
             )
         }
-
         if inserting_chunks:
             logger.info("Performing entity extraction on newly processed chunks")
             await extract_entities(
@@ -388,6 +406,9 @@ class MiniRAG:
                 relationships_vdb=self.relationships_vdb,
                 global_config=asdict(self),
             )
+        # Mark BM25 index dirty after any insertion
+        if hasattr(self, "_bm25_index_state"):
+            self._bm25_index_state["dirty"] = True
  
         await self._insert_done()
 
@@ -473,7 +494,7 @@ class MiniRAG:
     ) -> None:
         """
         Process pending documents by splitting them into chunks, processing
-        each chunk for entity and relation extraction, and updating the
+        each chunk for entity and relation extraction, embedding chunks to vector database, and updating the
         document status.
         """
         processing_docs, failed_docs, pending_docs = await asyncio.gather(
@@ -606,6 +627,15 @@ class MiniRAG:
                 self.chunk_entity_relation_graph,
                 param,
                 asdict(self),
+            )
+        elif param.mode == "bm25":
+            from .operate import bm25_query  # local import to avoid cycles
+            response = await bm25_query(
+                query,
+                self.text_chunks,
+                param,
+                asdict(self),
+                self._bm25_index_state,
             )
         else:
             raise ValueError(f"Unknown mode {param.mode}")

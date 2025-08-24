@@ -31,6 +31,141 @@ from .base import (
     QueryParam,
 )
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
+import math
+from dataclasses import dataclass
+
+#############################
+# Simple BM25 Implementation #
+#############################
+
+_RE_TOKEN = re.compile(r"\w+")
+
+def _tokenize(text: str) -> list[str]:
+    return _RE_TOKEN.findall(text.lower())
+
+@dataclass
+class _BM25Index:
+    corpus_tokens: list[list[str]]
+    doc_ids: list[str]
+    df: dict[str, int]
+    avgdl: float
+    k1: float = 1.5
+    b: float = 0.75
+
+    def score(self, query: str, top_k: int) -> list[tuple[str, float]]:
+        q_tokens = _tokenize(query)
+        if not q_tokens:
+            return []
+        N = len(self.corpus_tokens)
+        # precompute idf
+        idf_cache = {}
+        scores = [0.0] * N
+        for qt in q_tokens:
+            if qt not in self.df:
+                continue
+            if qt not in idf_cache:
+                # standard BM25 idf
+                df = self.df[qt]
+                idf_cache[qt] = math.log((N - df + 0.5) / (df + 0.5) + 1)
+            idf = idf_cache[qt]
+            for idx, doc_tokens in enumerate(self.corpus_tokens):
+                # compute tf for term in doc
+                tf = 0
+                # naive loop (acceptable for moderate corpus); could optimize with precomputed term freq maps
+                for t in doc_tokens:
+                    if t == qt:
+                        tf += 1
+                if tf == 0:
+                    continue
+                dl = len(doc_tokens)
+                denom = tf + self.k1 * (1 - self.b + self.b * dl / self.avgdl)
+                scores[idx] += idf * (tf * (self.k1 + 1)) / denom
+        ranked = sorted(((self.doc_ids[i], s) for i, s in enumerate(scores) if s > 0), key=lambda x: x[1], reverse=True)
+        return ranked[:top_k]
+
+async def build_bm25_index(text_chunks_db: BaseKVStorage[TextChunkSchema]) -> _BM25Index | None:
+    try:
+        all_ids = await text_chunks_db.all_keys()
+    except Exception:
+        return None
+    corpus_tokens = []
+    doc_ids = []
+    df = Counter()
+    # batch fetch to limit memory overhead of awaiting each individually
+    batch_size = 256
+    for i in range(0, len(all_ids), batch_size):
+        batch_ids = all_ids[i:i+batch_size]
+        batch = await text_chunks_db.get_by_ids(batch_ids)
+        for cid, chunk in zip(batch_ids, batch):
+            if not chunk or not chunk.get("content"):
+                continue
+            tokens = _tokenize(chunk["content"])[:4096]  # truncate very long docs
+            if not tokens:
+                continue
+            corpus_tokens.append(tokens)
+            doc_ids.append(cid)
+            for tok in set(tokens):
+                df[tok] += 1
+    if not corpus_tokens:
+        return None
+    avgdl = sum(len(t) for t in corpus_tokens) / len(corpus_tokens)
+    return _BM25Index(corpus_tokens=corpus_tokens, doc_ids=doc_ids, df=df, avgdl=avgdl)
+
+async def bm25_query(
+    query: str,
+    text_chunks_db: BaseKVStorage[TextChunkSchema],
+    query_param: QueryParam,
+    global_config: dict,
+    bm25_index_state: dict,
+) -> str:
+    """Perform a BM25 retrieval over all text chunks and optionally generate an answer via LLM.
+
+    bm25_index_state: a dict with keys {'index': _BM25Index|None, 'dirty': bool}
+    This allows MiniRAG to cache & invalidate the index after insertions without a new class.
+    """
+    # lazy build or rebuild index if marked dirty
+    if bm25_index_state.get("index") is None or bm25_index_state.get("dirty"):
+        bm25_index_state["index"] = await build_bm25_index(text_chunks_db)
+        bm25_index_state["dirty"] = False
+    index: _BM25Index | None = bm25_index_state.get("index")
+    if index is None:
+        return PROMPTS["fail_response"]
+    ranked = index.score(query, top_k=query_param.top_k)
+    if not ranked:
+        return PROMPTS["fail_response"]
+    # fetch chunk contents
+    chunk_ids = [cid for cid,_ in ranked]
+    chunks = await text_chunks_db.get_by_ids(chunk_ids)
+    # keep ordering by score
+    id2score = {cid:score for cid,score in ranked}
+    enriched = []
+    for cid, ch in zip(chunk_ids, chunks):
+        if ch:
+            enriched.append({"id": cid, "score": id2score[cid], **ch})
+    # truncate by token budget
+    maybe_trun_chunks = truncate_list_by_token_size(
+        enriched,
+        key=lambda x: x.get("content", ""),
+        max_token_size=query_param.max_token_for_text_unit,
+    )
+    section = "--BM25 Chunk--\n".join([c.get("content", "") for c in maybe_trun_chunks])
+    if query_param.only_need_context:
+        return section
+    use_model_func = global_config["llm_model_func"]
+    sys_prompt_temp = PROMPTS.get("naive_rag_response", PROMPTS["rag_response"])
+    sys_prompt = sys_prompt_temp.format(content_data=section, response_type=query_param.response_type) if "content_data" in sys_prompt_temp else sys_prompt_temp.format(context_data=section, response_type=query_param.response_type)
+    response = await use_model_func(query, system_prompt=sys_prompt)
+    if len(response) > len(sys_prompt):
+        response = (
+            response.replace(sys_prompt, "")
+            .replace("user", "")
+            .replace("model", "")
+            .replace(query, "")
+            .replace("<system>", "")
+            .replace("</system>", "")
+            .strip()
+        )
+    return response
 
 
 def chunking_by_token_size(
@@ -1253,58 +1388,72 @@ async def path2chunk(
         node_chunk_id = None
 
         for pathtuple, scorelist in v["Path"].items():
+            # collect edge-derived chunk ids
             if pathtuple in pairs_append:
                 use_edge = pairs_append[pathtuple]
-                edge_datas = []
                 edge_datas = await asyncio.gather(
                     *[knowledge_graph_inst.get_edge(r[0], r[1]) for r in use_edge]
                 )
-                text_units = [
-                    split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
-                    for dp in edge_datas  # chunk ID
-                ][0]
-
+                edge_datas = [ed for ed in edge_datas if ed and ed.get("source_id")]
+                text_units = []
+                for ed in edge_datas:
+                    try:
+                        text_units.extend(
+                            split_string_by_multi_markers(ed["source_id"], [GRAPH_FIELD_SEP])
+                        )
+                    except Exception:
+                        continue
             else:
-                use_edge = []
                 text_units = []
 
-            node_datas = await asyncio.gather(
-                *[knowledge_graph_inst.get_node(pathtuple[0])]
-            )
+            # first node in path tuple
+            node_datas = await asyncio.gather(*[knowledge_graph_inst.get_node(pathtuple[0])])
             for dp in node_datas:
-                text_units_node = split_string_by_multi_markers(
-                    dp["source_id"], [GRAPH_FIELD_SEP]
-                )
-                text_units = text_units + text_units_node
-
-            node_datas = await asyncio.gather(
-                *[knowledge_graph_inst.get_node(ents) for ents in pathtuple[1:]]
-            )
-            if query is not None:
-                for dp in node_datas:
+                if not dp or not dp.get("source_id"):
+                    continue
+                try:
                     text_units_node = split_string_by_multi_markers(
                         dp["source_id"], [GRAPH_FIELD_SEP]
                     )
-                    descriptionlist_node = split_string_by_multi_markers(
-                        dp["description"], [GRAPH_FIELD_SEP]
-                    )
-                    if descriptionlist_node[0] not in already_node.keys():
-                        already_node[descriptionlist_node[0]] = None
+                    text_units.extend(text_units_node)
+                except Exception:
+                    pass
 
-                        if len(text_units_node) == len(descriptionlist_node):
+            # remaining nodes
+            node_datas = await asyncio.gather(*[knowledge_graph_inst.get_node(ents) for ents in pathtuple[1:]])
+            if query is not None:
+                for dp in node_datas:
+                    if not dp:
+                        continue
+                    try:
+                        text_units_node = split_string_by_multi_markers(
+                            dp.get("source_id", ""), [GRAPH_FIELD_SEP]
+                        ) if dp.get("source_id") else []
+                        descriptionlist_node = split_string_by_multi_markers(
+                            dp.get("description", ""), [GRAPH_FIELD_SEP]
+                        ) if dp.get("description") else []
+                    except Exception:
+                        continue
+                    if not descriptionlist_node:
+                        continue
+                    desc_key = descriptionlist_node[0]
+                    if desc_key not in already_node:
+                        already_node[desc_key] = None
+                        if text_units_node and len(text_units_node) == len(descriptionlist_node):
                             if len(text_units_node) > 5:
                                 max_ids = int(max(5, len(text_units_node) / 2))
-                                should_consider_idx = calculate_similarity(
-                                    descriptionlist_node, query, k=max_ids
-                                )
-                                text_units_node = [
-                                    text_units_node[i] for i in should_consider_idx
-                                ]
-                                already_node[descriptionlist_node[0]] = text_units_node
+                                try:
+                                    should_consider_idx = calculate_similarity(
+                                        descriptionlist_node, query, k=max_ids
+                                    )
+                                    text_units_node = [text_units_node[i] for i in should_consider_idx]
+                                    already_node[desc_key] = text_units_node
+                                except Exception:
+                                    pass
                     else:
-                        text_units_node = already_node[descriptionlist_node[0]]
-                    if text_units_node is not None:
-                        text_units = text_units + text_units_node
+                        text_units_node = already_node.get(desc_key)
+                    if text_units_node:
+                        text_units.extend(text_units_node)
 
             count_dict = Counter(text_units)
             total_score = scorelist[0] + scorelist[1] + 1
@@ -1550,27 +1699,48 @@ async def minirag_query(  # MiniRAG
 
     try:
         keywords_data = json_repair.loads(result)
-
-        type_keywords = keywords_data.get("answer_type_keywords", [])
-        entities_from_query = keywords_data.get("entities_from_query", [])[:5]
-
     except json.JSONDecodeError:
+        # attempt crude salvage
         try:
-            result = (
+            cleaned = (
                 result.replace(kw_prompt[:-1], "")
                 .replace("user", "")
                 .replace("model", "")
                 .strip()
             )
-            result = "{" + result.split("{")[1].split("}")[0] + "}"
-            keywords_data = json_repair.loads(result)
-            type_keywords = keywords_data.get("answer_type_keywords", [])
-            entities_from_query = keywords_data.get("entities_from_query", [])[:5]
-
-        # Handle parsing error
+            if "{" in cleaned and "}" in cleaned:
+                inner = cleaned.split("{",1)[1].rsplit("}",1)[0]
+                keywords_data = json_repair.loads("{"+inner+"}")
+            else:
+                keywords_data = {}
         except Exception as e:
             print(f"JSON parsing error: {e}")
-            return PROMPTS["fail_response"]
+            keywords_data = {}
+
+    # Normalize structure: sometimes model returns a list of dicts
+    if isinstance(keywords_data, list):
+        picked = None
+        for item in keywords_data:
+            if isinstance(item, dict) and ("answer_type_keywords" in item or "entities_from_query" in item):
+                picked = item
+                break
+        keywords_data = picked if isinstance(picked, dict) else {}
+    elif not isinstance(keywords_data, dict):
+        keywords_data = {}
+
+    type_keywords = keywords_data.get("answer_type_keywords") or []
+    if not isinstance(type_keywords, list):
+        type_keywords = []
+    entities_from_query = keywords_data.get("entities_from_query") or []
+    if not isinstance(entities_from_query, list):
+        entities_from_query = []
+    entities_from_query = entities_from_query[:5]
+
+    if not entities_from_query and not type_keywords:
+        # Fallback: extract simple capitalized tokens as pseudo entities
+        import re as _re
+        candidates = list({_re.sub(r"[^A-Za-z0-9_ ]","", w).strip() for w in query.split() if w.istitle()})
+        entities_from_query = candidates[:3]
 
     context = await _build_mini_query_context(
         entities_from_query,
@@ -1629,7 +1799,7 @@ async def minirag_query(  # MiniRAG
     # put response
     output = f"-----Query Engineered-----\n" + result + "\n" + entities_from_response + "\n -----LLM Response:---- \n\n" + response
 
-    return output
+    return response
 
 async def meta_query(
     query: str,
