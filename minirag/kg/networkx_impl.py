@@ -174,23 +174,49 @@ class NetworkXStorage(BaseGraphStorage):
         return node_datas#,node_dict
     
 
-    async def get_neighbors_within_k_hops(self,source_node_id: str, k):
-        count = 0
-        if await self.has_node(source_node_id):
-            source_edge = list(self._graph.edges(source_node_id))
-        else:
-            print("NO THIS ID:",source_node_id)
-            return []
-        count = count+1
-        while count<k:
-            count = count+1
-            sc_edge = copy.deepcopy(source_edge)
-            source_edge =[]
-            for pair in sc_edge:
-                append_edge = list(self._graph.edges(pair[-1]))
-                for tuples in merge_tuples([pair],append_edge):
-                    source_edge.append(tuples)
-        return source_edge
+    async def get_neighbors_within_k_hops(self, source_node_id: str, k: int):
+        """Return list of path tuples up to k hops from source.
+
+        If the exact node id is missing, attempt a fuzzy / normalized match:
+          * strip quotes / whitespace
+          * case-insensitive exact match
+          * prefix match (first occurrence)
+        Returns empty list if still not found.
+        """
+        norm = source_node_id.strip().strip('"')
+        if not await self.has_node(source_node_id):
+            # try direct normalized equality (case-insensitive)
+            lowered = norm.lower()
+            candidate = None
+            for nid in self._graph.nodes:
+                if nid == norm:
+                    candidate = nid; break
+                if nid.lower() == lowered:
+                    candidate = nid; break
+            if candidate is None:
+                # prefix / containment heuristic
+                for nid in self._graph.nodes:
+                    if lowered and nid.lower().startswith(lowered):
+                        candidate = nid; break
+            if candidate is None:
+                logger.debug(f"get_neighbors_within_k_hops: node not found '{source_node_id}' after fuzzy search")
+                return []
+            source_node_id = candidate
+        # BFS-like expansion storing path tuples
+        visited_paths = []
+        frontier = [(source_node_id,)]
+        depth = 0
+        while depth < k and frontier:
+            new_frontier = []
+            for path in frontier:
+                last = path[-1]
+                for _, nbr in self._graph.edges(last):
+                    new_path = path + (nbr,)
+                    visited_paths.append(new_path)
+                    new_frontier.append(new_path)
+            frontier = new_frontier
+            depth += 1
+        return visited_paths
     
 
     async def has_node(self, node_id: str) -> bool:
@@ -200,13 +226,40 @@ class NetworkXStorage(BaseGraphStorage):
         return self._graph.has_edge(source_node_id, target_node_id)
 
     async def get_node(self, node_id: str) -> Union[dict, None]:
-        return self._graph.nodes.get(node_id)
+        # direct hit
+        if self._graph.has_node(node_id):
+            return self._graph.nodes.get(node_id)
+        # fuzzy normalization
+        norm = node_id.strip().strip('"')
+        lowered = norm.lower()
+        candidate = None
+        for nid in self._graph.nodes:
+            if nid == norm or nid.lower() == lowered:
+                candidate = nid; break
+        if candidate is None:
+            for nid in self._graph.nodes:
+                if lowered and nid.lower().startswith(lowered):
+                    candidate = nid; break
+        if candidate and self._graph.has_node(candidate):
+            return self._graph.nodes.get(candidate)
+        return None
 
     async def node_degree(self, node_id: str) -> int:
-        return self._graph.degree(node_id)
+        try:
+            if not self._graph.has_node(node_id):
+                return 0
+            # Use neighbor count to avoid type checker confusion with DegreeView
+            return int(len(list(self._graph.neighbors(node_id))))
+        except Exception:
+            return 0
 
     async def edge_degree(self, src_id: str, tgt_id: str) -> int:
-        return self._graph.degree(src_id) + self._graph.degree(tgt_id)
+        try:
+            s = int(len(list(self._graph.neighbors(src_id)))) if self._graph.has_node(src_id) else 0
+            t = int(len(list(self._graph.neighbors(tgt_id)))) if self._graph.has_node(tgt_id) else 0
+            return s + t
+        except Exception:
+            return 0
 
     async def get_edge(
         self, source_node_id: str, target_node_id: str

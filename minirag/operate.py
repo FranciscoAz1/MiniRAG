@@ -467,7 +467,6 @@ async def extract_entities(
     results = await asyncio.gather(
         *[_process_single_content(c) for c in ordered_chunks]
     )
-    print()  # clear the progress bar
     maybe_nodes = defaultdict(list)
     maybe_edges = defaultdict(list)
     for m_nodes, m_edges in results:
@@ -496,6 +495,7 @@ async def extract_entities(
         )
         return None
 
+    # Insert in to database
     if entity_vdb is not None:
         data_for_vdb = {
             compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
@@ -1465,19 +1465,25 @@ async def path2chunk(
                 node_chunk_id = node_chunk_id + count_dict
         v["Path"] = []
         if node_chunk_id is None:
-            node_datas = await asyncio.gather(*[knowledge_graph_inst.get_node(k)])
+            # Fallback: no aggregated path info; use the node's own source_id chunks
+            node_datas = await asyncio.gather(knowledge_graph_inst.get_node(k))
+            fallback_counter = Counter()
             for dp in node_datas:
-                text_units_node = split_string_by_multi_markers(
-                    dp["source_id"], [GRAPH_FIELD_SEP]
-                )
-                count_dict = Counter(text_units_node)
-
-            for id in count_dict.most_common(max_chunks):
-                v["Path"].append(id[0])
-            # v['Path'] = count_dict.most_common(max_chunks)#[]
+                if not dp or not dp.get("source_id"):
+                    continue
+                try:
+                    text_units_node = split_string_by_multi_markers(
+                        dp["source_id"], [GRAPH_FIELD_SEP]
+                    )
+                    fallback_counter.update(text_units_node)
+                except Exception:
+                    continue
+            for chunk_id, _ in fallback_counter.most_common(max_chunks):
+                v["Path"].append(chunk_id)
         else:
-            for id in count_dict.most_common(max_chunks):
-                v["Path"].append(id[0])
+            # Use the aggregated counter built from paths & edges
+            for chunk_id, _ in node_chunk_id.most_common(max_chunks):
+                v["Path"].append(chunk_id)
             # v['Path'] = node_chunk_id.most_common(max_chunks)
     return scored_edged_reasoning_path
 
@@ -1619,6 +1625,7 @@ async def _build_mini_query_context(
             for entity_name in scored_edged_reasoning_path.keys()
         ]
     )
+
     node_datas = [
         {**n, "entity_name": k, "Score": scored_edged_reasoning_path[k]["Score"]}
         for k, n in zip(scored_edged_reasoning_path.keys(), node_datas)
