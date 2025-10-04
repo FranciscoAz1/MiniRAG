@@ -151,7 +151,7 @@ class NetworkXStorage(BaseGraphStorage):
         types_with_case = set()
 
         for _, data in self._graph.nodes(data=True):
-            if "type" in data:
+            if "entity_type" in data:
                 types.add(data["entity_type"].lower()) 
                 types_with_case.add(data["entity_type"])  
         return list(types), list(types_with_case)
