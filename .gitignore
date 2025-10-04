@@ -26,3 +26,7 @@ examples/output/
 *.ini
 build/
 minirag-venv/
+*.txt
+*.csv
+*.xlsx
+*.pdf
