@@ -24,6 +24,82 @@ The Code Repository: **MiniRAG: Towards Extremely Simple Retrieval-Augmented Gen
 - [x] [2025.02.05]🎯📢Our team has released [VideoRAG](https://github.com/HKUDS/VideoRAG) understanding extremely long-context videos.
 - [x] [2025.02.01]🎯📢Now MiniRAG supports API&Docker deployment. see [This](./minirag/api/README.md) for more details.
 
+## ✨ Key Features
+
+- **🎯 Heterogeneous Graph Indexing**: Combines text chunks and named entities in a unified graph structure for efficient knowledge representation
+- **🚀 Lightweight Retrieval**: Topology-enhanced retrieval that leverages graph structures without requiring advanced language capabilities
+- **💾 Multiple Storage Backends**: Supports 10+ graph databases including Neo4j, PostgreSQL, TiDB, MongoDB, Redis, Oracle, Milvus, Chroma, Weaviate, and more
+- **🔌 Flexible LLM Integration**: Works with Ollama, OpenAI, Azure OpenAI, LoLLMs, and HuggingFace models
+- **🔍 Multiple Query Modes**: Offers mini, light, naive, doc, metadata, BM25, and bypass modes for different use cases
+- **🌐 REST API & Docker**: Deploy via FastAPI server with full REST API support and Docker containerization
+- **📦 Easy Installation**: Available via PyPI (`pip install minirag-hku`) or install from source
+- **🎨 Ollama Emulation**: Compatible with Ollama API for seamless integration with AI frontends like Open WebUI
+
+## 🔍 Query Modes
+
+MiniRAG provides multiple query modes to suit different retrieval scenarios:
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| **mini** | MiniRAG's topology-enhanced retrieval with heterogeneous graph | Best for complex queries requiring entity relationships |
+| **light** | Lightweight version with reduced graph complexity | Balanced performance and speed |
+| **naive** | Simple vector similarity search | Quick lookups with minimal overhead |
+| **doc** | Direct document retrieval by document ID | When you know the specific document |
+| **meta** | Metadata-based filtering and search | Filtering by document properties |
+| **bm25** | Traditional BM25 keyword search | Keyword-based retrieval |
+| **bypass** | Direct LLM query without RAG | When RAG is not needed |
+
+## 💾 Supported Storage Backends
+
+### Graph Databases
+- **Neo4j**: Industry-standard graph database
+- **PostgreSQL with AGE**: SQL database with graph extensions
+- **TiDB**: Distributed SQL database with graph support
+- **MongoDB**: Document database with graph capabilities
+- **Oracle**: Enterprise graph database
+- **Gremlin**: Graph traversal language compatible stores
+
+### Vector Databases
+- **Milvus**: Specialized vector similarity search
+- **Chroma**: Lightweight vector database
+- **Weaviate**: AI-native vector database
+- **NanoVectorDB**: Embedded vector storage
+- **PostgreSQL pgvector**: Vector extension for PostgreSQL
+
+### Key-Value Stores
+- **Redis**: In-memory key-value store
+- **JSON**: Local file-based storage
+- **PostgreSQL**: Relational key-value storage
+
+## 🤖 LLM & Embedding Support
+
+MiniRAG supports multiple LLM and embedding model backends:
+
+- **Ollama**: Local models (default: mistral-nemo, bge-m3)
+- **OpenAI**: GPT-4, GPT-4o-mini, text-embedding-3-small/large
+- **Azure OpenAI**: Enterprise OpenAI deployments
+- **LoLLMs**: Local LLM server
+- **HuggingFace**: Open-source models (Phi-3, GLM-Edge, Qwen, MiniCPM, etc.)
+
+## 🌐 API & Deployment
+
+MiniRAG provides a comprehensive REST API for easy integration:
+
+### API Features
+- **Query Endpoints**: `/query`, `/query/stream` for RAG queries
+- **Document Management**: Upload text, files, or batch documents
+- **Ollama Compatibility**: Emulates Ollama API (`/api/chat`, `/api/tags`, `/api/version`)
+- **Health Monitoring**: `/health` endpoint for status checks
+- **Metadata Search**: Filter and query by document metadata
+
+### Deployment Options
+- **Docker**: Full containerization with docker-compose support
+- **FastAPI Server**: Standalone API server (`minirag-server` command)
+- **Linux Service**: Systemd service configuration included
+- **Python Package**: Direct integration in Python applications
+
+For detailed API documentation, see [minirag/api/README.md](./minirag/api/README.md)
+
 ## TLDR
 MiniRAG is an extremely simple retrieval-augmented generation framework that enables small models to achieve good RAG performance through heterogeneous graph indexing and lightweight topology-enhanced retrieval.
 
