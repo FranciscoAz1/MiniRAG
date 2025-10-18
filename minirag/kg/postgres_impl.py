@@ -375,13 +375,13 @@ class PGVectorStorage(BaseVectorStorage):
 
         async def wrapped_task(batch):
             result = await self.embedding_func(batch)
-            pbar.update(1)
+            # pbar.update(1)
             return result
 
         embedding_tasks = [wrapped_task(batch) for batch in batches]
-        pbar = tqdm_async(
-            total=len(embedding_tasks), desc="Generating embeddings", unit="batch"
-        )
+        # pbar = tqdm_async(
+        #     total=len(embedding_tasks), desc="Generating embeddings", unit="batch"
+        # )
         embeddings_list = await asyncio.gather(*embedding_tasks)
 
         embeddings = np.concatenate(embeddings_list)

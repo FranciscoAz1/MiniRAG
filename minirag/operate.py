@@ -30,6 +30,9 @@ from .base import (
     TextChunkSchema,
     QueryParam,
 )
+from .metadata_plugin import (
+    minirag_generate_metadata
+)
 from .prompt import GRAPH_FIELD_SEP, PROMPTS
 import math
 from dataclasses import dataclass
@@ -463,7 +466,6 @@ async def extract_entities(
         )
         return dict(maybe_nodes), dict(maybe_edges)
 
-    # use_llm_func is wrapped in ascynio.Semaphore, limiting max_async callings
     results = await asyncio.gather(
         *[_process_single_content(c) for c in ordered_chunks]
     )
@@ -542,6 +544,169 @@ async def extract_entities(
 
     return knowledge_graph_inst
 
+async def presidio_entity_extraction(
+    chunks: dict[str, TextChunkSchema],
+    knowledge_graph_inst: BaseGraphStorage,
+    entity_vdb: BaseVectorStorage,
+    entity_name_vdb: BaseVectorStorage,
+    relationships_vdb: BaseVectorStorage,
+    global_config: dict,
+) -> Union[BaseGraphStorage, None]:
+    """
+    Extract entities from text using Presidio-based metadata extraction.
+    Deprecated
+    """
+    logger.info("Using Presidio for entity extraction")
+
+    ordered_chunks = list(chunks.items())
+    already_processed = 0
+    already_entities = 0
+    already_relations = 0
+
+    async def _process_single_chunk(chunk_key_dp: tuple[str, TextChunkSchema]):
+        nonlocal already_processed, already_entities, already_relations
+        chunk_key = chunk_key_dp[0]
+        chunk_dp = chunk_key_dp[1]
+        content = chunk_dp["content"]
+    
+        # Use minirag_generate_metadata for regex-based extraction
+        metadata = minirag_generate_metadata(
+            doc_id=chunk_key,
+            text=content,
+            path=chunk_key,  # Use chunk_key as path
+            extractor=global_config.get("metadata_extractor")
+        )
+        
+        maybe_nodes = defaultdict(list)
+        maybe_edges = defaultdict(list)
+
+        keys = metadata.keys()
+        
+        # Extract entities from metadata
+        entities = metadata.get("entities", [])
+        person_names = metadata.get("person_names", [])
+        pii_detections = metadata.get("pii_detections", [])
+        
+        # Process PII detections
+        for detection in pii_detections:
+            entity_text = detection.get("text", "").strip()
+            if not entity_text:
+                continue
+                
+            entity_name = clean_str(entity_text.upper())
+            if not entity_name.strip():
+                continue
+
+            entity_type = detection.get("entity_type", "PII")
+
+            entity_data = dict(
+                entity_name=entity_name,
+                entity_type=entity_type,
+                description=f"",
+                source_id=chunk_key,
+            )
+            maybe_nodes[entity_name].append(entity_data)
+        
+        # Create relationships between entities in the same chunk
+        entity_names_in_chunk = list(maybe_nodes.keys())
+        for i, src_name in enumerate(entity_names_in_chunk):
+            for tgt_name in entity_names_in_chunk[i+1:]:
+                # Create a relationship between co-occurring entities
+                relationship_data = dict(
+                    src_id=src_name,
+                    tgt_id=tgt_name,
+                    weight=1.0,
+                    description=f"",
+                    keywords="co-occurrence",
+                    source_id=chunk_key,
+                )
+                edge_key = (src_name, tgt_name)
+                maybe_edges[edge_key].append(relationship_data)
+        
+        already_processed += 1
+        already_entities += len(maybe_nodes)
+        already_relations += len(maybe_edges)
+        
+        now_ticks = PROMPTS["process_tickers"][
+            already_processed % len(PROMPTS["process_tickers"])
+        ]
+        print(
+            f"{now_ticks} Processed {already_processed} chunks, {already_entities} entities(duplicated), {already_relations} relations(duplicated)\r",
+            end="",
+            flush=True,
+        )
+        return dict(maybe_nodes), dict(maybe_edges)
+
+    results = await asyncio.gather(
+        *[_process_single_chunk(c) for c in ordered_chunks]
+    )
+    
+    maybe_nodes = defaultdict(list)
+    maybe_edges = defaultdict(list)
+    for m_nodes, m_edges in results:
+        for k, v in m_nodes.items():
+            maybe_nodes[k].extend(v)
+        for k, v in m_edges.items():
+            maybe_edges[tuple(sorted(k))].extend(v)
+    
+    all_entities_data = await asyncio.gather(
+        *[
+            _merge_nodes_then_upsert(k, v, knowledge_graph_inst, global_config)
+            for k, v in maybe_nodes.items()
+        ]
+    )
+    
+    all_relationships_data = await asyncio.gather(
+        *[
+            _merge_edges_then_upsert(k[0], k[1], v, knowledge_graph_inst, global_config)
+            for k, v in maybe_edges.items()
+        ]
+    )
+    
+    if not len(all_entities_data):
+        logger.warning("Didn't extract any entities, maybe the Presidio extraction failed")
+        return None
+    if not len(all_relationships_data):
+        logger.warning(
+            "Didn't extract any relationships, this is normal for Presidio extraction"
+        )
+
+    # Insert into vector databases
+    if entity_vdb is not None:
+        data_for_vdb = {
+            compute_mdhash_id(dp["entity_name"], prefix="ent-"): {
+                "content": dp["entity_name"] + dp["description"],
+                "entity_name": dp["entity_name"],
+            }
+            for dp in all_entities_data
+        }
+        await entity_vdb.upsert(data_for_vdb)
+
+    if entity_name_vdb is not None:
+        data_for_vdb = {
+            compute_mdhash_id(dp["entity_name"], prefix="Ename-"): {
+                "content": dp["entity_name"],
+                "entity_name": dp["entity_name"],
+            }
+            for dp in all_entities_data
+        }
+        await entity_name_vdb.upsert(data_for_vdb)
+
+    if relationships_vdb is not None:
+        data_for_vdb = {
+            compute_mdhash_id(dp["src_id"] + dp["tgt_id"], prefix="rel-"): {
+                "src_id": dp["src_id"],
+                "tgt_id": dp["tgt_id"],
+                "content": dp["keywords"]
+                + " " + dp["src_id"]
+                + " " + dp["tgt_id"]
+                + " " + dp["description"],
+            }
+            for dp in all_relationships_data
+        }
+        await relationships_vdb.upsert(data_for_vdb)
+
+    return knowledge_graph_inst
 
 async def local_query(
     query,
@@ -1629,6 +1794,7 @@ async def _build_mini_query_context(
     node_datas = [
         {**n, "entity_name": k, "Score": scored_edged_reasoning_path[k]["Score"]}
         for k, n in zip(scored_edged_reasoning_path.keys(), node_datas)
+        if n is not None
     ]
     for i, n in enumerate(node_datas):
         entites_section_list.append(
@@ -1657,9 +1823,6 @@ async def _build_mini_query_context(
     final_chunk_id = kwd2chunk(
         ent_from_query_dict, chunks_ids, chunk_nums=int(query_param.top_k / 2)
     )
-
-    if not len(results_node):
-        return None
 
     if not len(results_edge):
         return None
@@ -1743,11 +1906,11 @@ async def minirag_query(  # MiniRAG
         entities_from_query = []
     entities_from_query = entities_from_query[:5]
 
-    if not entities_from_query and not type_keywords:
-        # Fallback: extract simple capitalized tokens as pseudo entities
-        import re as _re
-        candidates = list({_re.sub(r"[^A-Za-z0-9_ ]","", w).strip() for w in query.split() if w.istitle()})
-        entities_from_query = candidates[:3]
+    # if not entities_from_query and not type_keywords:
+    #     # Fallback: extract simple capitalized tokens as pseudo entities
+    #     import re as _re
+    #     candidates = list({_re.sub(r"[^A-Za-z0-9_ ]","", w).strip() for w in query.split() if w.istitle()})
+    #     entities_from_query = candidates[:3]
 
     context = await _build_mini_query_context(
         entities_from_query,

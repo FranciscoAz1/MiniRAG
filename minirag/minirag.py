@@ -4,8 +4,11 @@ import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from functools import partial
+import sys
 from typing import Type, cast, Any
 from dotenv import load_dotenv
+from minirag.prompt import PROMPTS
+from .metadata_plugin import minirag_generate_metadata, MetadataExtractor
 
 
 from .operate import (
@@ -16,6 +19,7 @@ from .operate import (
     minirag_query,
     naive_query,
     meta_query,
+    presidio_entity_extraction,
 )
 
 from .utils import (
@@ -129,7 +133,6 @@ class MiniRAG:
     )
 
     # RAGmode: str = 'minirag'
-
     kv_storage: str = field(default="JsonKVStorage")
     vector_storage: str = field(default="NanoVectorDBStorage")
     graph_storage: str = field(default="NetworkXStorage")
@@ -138,14 +141,14 @@ class MiniRAG:
     log_level: str = field(default=current_log_level)
 
     # text chunking
-    chunk_token_size: int = 1200
-    chunk_overlap_token_size: int = 100
+    chunk_token_size: int = 200
+    chunk_overlap_token_size: int = 5
     tiktoken_model_name: str = "gpt-4o-mini"
 
     # entity extraction
     entity_extract_max_gleaning: int = 1
     entity_summary_to_max_tokens: int = 500
-
+    entity_presidio_extraction: bool = False
     # node embedding
     node_embedding_algorithm: str = "node2vec"
     node2vec_params: dict = field(
@@ -332,6 +335,9 @@ class MiniRAG:
             embedding_func=None,
         )
 
+        # Initialize metadata extractor with lazy-loaded analyzer
+        self.metadata_extractor = MetadataExtractor()
+
     def _get_storage_class(self, storage_name: str) -> dict:
         import_path = STORAGES[storage_name]
         storage_class = lazy_external_import(import_path, storage_name)
@@ -379,6 +385,7 @@ class MiniRAG:
         await self.apipeline_process_enqueue_documents(
             split_by_character, split_by_character_only
         )
+        # Generate and attach metadata using the metadata plugin
 
         # Perform additional entity extraction as per original ainsert logic
         inserting_chunks = {
@@ -398,14 +405,26 @@ class MiniRAG:
         }
         if inserting_chunks:
             logger.info("Performing entity extraction on newly processed chunks")
-            await extract_entities(
-                inserting_chunks,
-                knowledge_graph_inst=self.chunk_entity_relation_graph,
-                entity_vdb=self.entities_vdb,
-                entity_name_vdb=self.entity_name_vdb,
-                relationships_vdb=self.relationships_vdb,
-                global_config=asdict(self),
-            )
+            if self.entity_presidio_extraction:
+                logger.info("Using Presidio for entity extraction")
+                await presidio_entity_extraction(
+                    inserting_chunks,
+                    knowledge_graph_inst=self.chunk_entity_relation_graph,
+                    entity_vdb=self.entities_vdb,
+                    entity_name_vdb=self.entity_name_vdb,
+                    relationships_vdb=self.relationships_vdb,
+                    global_config={**asdict(self), "metadata_extractor": self.metadata_extractor},
+                    )
+            else:
+                logger.info("Using custom entity extraction")
+                await extract_entities(     
+                    inserting_chunks,
+                    knowledge_graph_inst=self.chunk_entity_relation_graph,
+                    entity_vdb=self.entities_vdb,
+                    entity_name_vdb=self.entity_name_vdb,
+                    relationships_vdb=self.relationships_vdb,
+                    global_config=asdict(self),
+                )
         # Mark BM25 index dirty after any insertion
         if hasattr(self, "_bm25_index_state"):
             self._bm25_index_state["dirty"] = True
@@ -538,6 +557,8 @@ class MiniRAG:
                     self.full_docs.upsert({doc_id: {"content": status_doc.content}}),
                     self.text_chunks.upsert(chunks),
                 )
+                if self.entity_presidio_extraction:
+                    meta = minirag_generate_metadata(doc_id, status_doc.content, status_doc.file_path, self.metadata_extractor)
                 await self.doc_status.upsert(
                     {
                         doc_id: {
@@ -639,11 +660,11 @@ class MiniRAG:
             )
         elif param.mode == "bypass":
             # Bypass mode: directly use LLM without knowledge retrieval
-            use_llm_func = param.model_func or global_config["llm_model_func"]
+            use_llm_func = self.llm_model_func
             param.stream = True if param.stream is None else param.stream
             response = await use_llm_func(
                 query.strip(),
-                system_prompt=system_prompt,
+                system_prompt=PROMPTS["rag_response"],
                 history_messages=param.conversation_history,
                 stream=param.stream,
             )

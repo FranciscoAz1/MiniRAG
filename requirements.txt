@@ -32,3 +32,6 @@ tqdm
 xxhash
 
 # Extra libraries are installed when needed using pipmaster
+
+# Optional PII detection (install to enable richer metadata)
+# presidio-analyzer

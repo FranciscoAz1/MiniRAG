@@ -5,8 +5,10 @@
 import os
 from minirag import MiniRAG, QueryParam
 from minirag.llm.hf import (
-    hf_model_complete,
     hf_embed,
+)
+from minirag.llm.ollama import (
+    ollama_model_complete,
 )
 from minirag.utils import EmbeddingFunc
 from transformers import AutoModel, AutoTokenizer
@@ -18,7 +20,7 @@ import argparse
 
 def get_args():
     parser = argparse.ArgumentParser(description="MiniRAG")
-    parser.add_argument("--model", type=str, default="PHI")
+    parser.add_argument("--model", type=str, default="qwen2")
     parser.add_argument("--outputpath", type=str, default="./logs/Default_output.csv")
     parser.add_argument("--workingdir", type=str, default="./LiHua-World")
     parser.add_argument("--datapath", type=str, default="./dataset/LiHua-World/data/")
@@ -40,6 +42,8 @@ elif args.model == "MiniCPM":
     LLM_MODEL = "openbmb/MiniCPM3-4B"
 elif args.model == "qwen":
     LLM_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+elif args.model == "qwen2":
+    LLM_MODEL = "qwen2m:latest"
 else:
     print("Invalid model name")
     exit(1)
@@ -57,7 +61,7 @@ if not os.path.exists(WORKING_DIR):
 
 rag = MiniRAG(
     working_dir=WORKING_DIR,
-    llm_model_func=hf_model_complete,
+    llm_model_func=ollama_model_complete,
     llm_model_max_token_size=200,
     llm_model_name=LLM_MODEL,
     embedding_func=EmbeddingFunc(
@@ -73,6 +77,7 @@ rag = MiniRAG(
 
 
 # Now indexing
+print("Indexing...")
 def find_txt_files(root_path):
     txt_files = []
     for root, dirs, files in os.walk(root_path):
@@ -81,7 +86,7 @@ def find_txt_files(root_path):
                 txt_files.append(os.path.join(root, file))
     return txt_files
 
-
+print("Inserting files into RAG...")
 WEEK_LIST = find_txt_files(DATA_PATH)
 for WEEK in WEEK_LIST:
     id = WEEK_LIST.index(WEEK)
